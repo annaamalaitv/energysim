@@ -1,0 +1,74 @@
+import pandas as pd
+import matplotlib.pyplot as plt
+from pathlib import Path
+
+# --- STEP 1: Load and Clean Both Datasets ---
+# Path to your baseline results (sim1)
+base_csv = Path(r"C:\Users\annaa\Downloads\IISC\sim1\sim_results\eplusout.csv")
+df_base = pd.read_csv(base_csv)
+df_base.columns = df_base.columns.str.strip()
+
+# Path to your altered results (modidf folder)
+alt_csv = Path(r"C:\Users\annaa\Downloads\IISC\sim1\modidf\eplusout.csv")
+df_alt = pd.read_csv(alt_csv)
+df_alt.columns = df_alt.columns.str.strip()
+
+# Dynamically extract energy tracking columns to prevent string errors
+energy_col_base = [col for col in df_base.columns if "Electricity Demand Rate" in col][0]
+energy_col_alt = [col for col in df_alt.columns if "Electricity Demand Rate" in col][0]
+
+# --- STEP 2: Establish Identical Chronological Metrics ---
+for df in [df_base, df_alt]:
+    df['Hour'] = df.index % 24
+    df['Day_of_Year'] = df.index // 24
+
+# =====================================================================
+# 🛠️ CHOOSE YOUR ANALYSIS WEEK HERE
+# =====================================================================
+# Let's target a peak summer week (e.g., Days 195 to 202 is mid-July)
+start_day = 195  
+end_day = 202
+# =====================================================================
+
+# --- STEP 3: Filter Both Datasets to the Same Window ---
+week_base = df_base[(df_base['Day_of_Year'] >= start_day) & (df_base['Day_of_Year'] < end_day)].copy()
+week_alt = df_alt[(df_alt['Day_of_Year'] >= start_day) & (df_alt['Day_of_Year'] < end_day)].copy()
+
+# Sync timelines sequentially from 0 to 168 hours
+week_base['Timeline_Hours'] = range(len(week_base))
+week_alt['Timeline_Hours'] = range(len(week_alt))
+
+# --- STEP 4: Generate the Comparative Graph ---
+plt.figure(figsize=(15, 6))
+
+# Plot Baseline (Solid blue line)
+plt.plot(
+    week_base['Timeline_Hours'], 
+    week_base[energy_col_base], 
+    color='#1f77b4', 
+    linewidth=2, 
+    label='Baseline Case Profile'
+)
+
+# Plot Altered Variant (Dashed orange line overlay)
+plt.plot(
+    week_alt['Timeline_Hours'], 
+    week_alt[energy_col_alt], 
+    color='#ff7f0e', 
+    linewidth=2, 
+    linestyle='--', 
+    label='Altered Case Profile (Modified Parameter)'
+)
+
+# --- STEP 5: Architecture and Formatting Rules ---
+plt.title(f'Hourly Whole-Building Energy Comparison: Selected Week Profile (Days {start_day} to {end_day})', fontsize=13, fontweight='bold')
+plt.xlabel('Continuous Timeline Hours across the Selected Week', fontsize=11)
+plt.ylabel('Total Building Energy Consumption [Watts]', fontsize=11)
+
+plt.xlim(0, 168)  # Clamp exactly to a 168-hour consecutive loop (7 Days)
+plt.grid(True, linestyle='--', alpha=0.5)
+plt.legend(loc='upper right', fontsize=10)
+plt.tight_layout()
+
+# Run and showcase the graph
+plt.show()
