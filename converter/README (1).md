@@ -1,6 +1,6 @@
 # Interactive BIM Viewer and Adaptive IFC-to-IDF Converter
 
-This project was developed during the IASc-INSA-NASI Summer Research Fellowship 2026 at the Indian Institute of Science (IISc), Bengaluru. It combines an interactive IFC viewer with a Python-based converter that generates a baseline EnergyPlus 9.4 IDF model.
+It combines an interactive IFC viewer with a Python-based converter that generates a baseline EnergyPlus 9.4 IDF model.
 
 The main aim is safe and transparent conversion. If a part of the IFC model cannot be converted reliably, the program skips it or uses a clearly reported fallback instead of silently creating invalid EnergyPlus geometry.
 
@@ -186,14 +186,5 @@ For each IFC test case, record:
 | EnergyPlus Severe and Fatal errors |  |
 | Annual electricity, heating and cooling |  |
 
-## Research scope
 
-The intended contribution is an uncertainty-aware and safety-focused IFC-to-IDF workflow. The program reports assumptions, rejects unsafe geometry and validates the generated object-reference graph. It is not claimed to convert every IFC model perfectly or to produce universally accurate annual energy results.
 
-## Author
-
-**Anurag Bashal**  
-B.Tech., Civil Engineering, National Institute of Technology Agartala  
-Summer Research Fellow, Indian Institute of Science, Bengaluru  
-
-**Guide:** Dr. Pandarasamy Arjunan, Indian Institute of Science
