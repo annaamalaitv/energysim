@@ -2423,11 +2423,9 @@ def _add_baseline_loads(idf, zone_name: str, floor_area_m2: float, space_name: s
 # =====================================================================
 # SECTION 7 — MAIN CONVERTER
 # =====================================================================
-def generate_baseline_idf_from_ifc(ifc, ifc_data: dict):
-    settings = _new_geometry_settings()
-
-    native_scale_to_m = _length_scale_to_m(ifc)
-    report = {
+def _create_conversion_report(native_scale_to_m: float) -> dict:
+    """Create the mutable report shared by every conversion operation."""
+    return {
         "warnings": [], "zones_created": 0, "zones_skipped": 0, "windows_converted": 0, 
         "windows_skipped": 0, "doors_converted": 0, "doors_skipped": 0,
         "shared_surfaces_matched": 0, "space_boundaries_used": 0,
@@ -2458,9 +2456,11 @@ def generate_baseline_idf_from_ifc(ifc, ifc_data: dict):
             "multiply-connected EnergyPlus surface decomposition",
         ],
     }
-    idf = _initialise_idf(ifc, ifc_data, report, native_scale_to_m)
 
-    # Element Cache & Spatial Index
+
+def _build_conversion_element_cache(ifc, settings, native_scale_to_m: float,
+                                    report: dict) -> list:
+    """Tessellate envelope elements once for material and adjacency mapping."""
     element_cache = []
     cached_element_guids = set()
     for el_type in ("IfcWall", "IfcWallStandardCase", "IfcCurtainWall", "IfcSlab", "IfcRoof"):
@@ -2479,10 +2479,13 @@ def generate_baseline_idf_from_ifc(ifc, ifc_data: dict):
                     })
             except Exception as e:
                 report["warnings"].append(f"Cache failed for {el.GlobalId}: {str(e)}")
-                
-    all_surfaces, surface_names, zone_names, zone_info, construction_cache = [], set(), set(), {}, {}
-    prepared_zones = []
+    return element_cache
 
+
+def _prepare_conversion_zones(ifc, ifc_data: dict, settings, report: dict,
+                              native_scale_to_m: float) -> list:
+    """Extract the best available closed geometry for every IFC space."""
+    prepared_zones = []
     for space in ifc_data.get("spaces", []):
         try:
             element = ifc.by_guid(space["global_id"])
@@ -2496,9 +2499,14 @@ def generate_baseline_idf_from_ifc(ifc, ifc_data: dict):
         except Exception as e:
             report["zones_skipped"] += 1
             report["warnings"].append(f"Space geometry failed {space['global_id']}: {str(e)}")
+    if not prepared_zones:
+        raise ValueError("No usable IfcSpace geometry converted.")
+    return prepared_zones
 
-    if not prepared_zones: raise ValueError("No usable IfcSpace geometry converted.")
 
+def _rebase_conversion_geometry(prepared_zones: list, element_cache: list,
+                                report: dict):
+    """Move EnergyPlus geometry near the origin and report original IFC bounds."""
     original_min = np.array([
         min(meta["bbox"][0] for _, _, _, meta in prepared_zones),
         min(meta["bbox"][1] for _, _, _, meta in prepared_zones),
@@ -2517,10 +2525,6 @@ def generate_baseline_idf_from_ifc(ifc, ifc_data: dict):
             f"Converted building extents are physically implausible ({original_spans.tolist()} m); "
             "IFC length units or placement translations are inconsistent."
         )
-
-    # Rebase backend EnergyPlus geometry near the origin. This preserves all
-    # relative dimensions while avoiding precision failures from georeferenced
-    # eastings/northings. The Plotly UI continues using the original IFC mesh.
     coordinate_offset = original_min.copy()
     rebased_zones = []
     for space, surfaces, source, metadata in prepared_zones:
@@ -2558,98 +2562,135 @@ def generate_baseline_idf_from_ifc(ifc, ifc_data: dict):
     }
     report["energyplus_coordinate_offset_m"] = coordinate_offset.tolist()
     elevation_tol = max(0.03, min(0.15, max(building_max_z - building_min_z, 1.0) * 1e-4))
+    return (
+        prepared_zones, coordinate_offset, strtree,
+        building_min_z, building_max_z, elevation_tol,
+    )
 
-    for space, surfaces, geometry_source, metadata in prepared_zones:
-        zone_name = _unique_name(zone_names, _safe_name(space.get("name"), "Zone_"))
-        zone = idf.newidfobject("ZONE", Name=zone_name, Multiplier=1)
-        bbox = metadata["bbox"]
-        
-        floor_area = sum(_polygon_area(s["vertices"]) for s in surfaces if s["role"] == "floor")
-        if floor_area <= 0: floor_area = max((bbox[3] - bbox[0]) * (bbox[4] - bbox[1]), 1.0)
-        volume = float(metadata.get("mesh_volume") or 0.0)
-        if volume < MIN_ZONE_VOLUME:
-            volume = floor_area * max(bbox[5] - bbox[2], DEFAULT_ROOM_HEIGHT_M)
-            report["warnings"].append(f"{zone_name}: volume inferred because no validated closed shell was available")
-        bbox_volume = max((bbox[3]-bbox[0])*(bbox[4]-bbox[1])*(bbox[5]-bbox[2]), 1e-9)
-        
-        # Leave Zone volume, floor area, and ceiling height blank so EnergyPlus
-        # calculates them from the validated closed shell. Serializing estimates
-        # caused the supplied area/volume mismatch warnings.
 
-        zone_surface_records = []
-        mapped_material_count = 0
-        
-        for index, surface in enumerate(surfaces, 1):
-            is_virtual = surface.get("boundary_physical_virtual") == "VIRTUAL"
-            nearest = None if is_virtual else (_nearest_element_indexed(surface, element_cache, strtree) if strtree else None)
-            layers = nearest["layers"] if nearest and nearest["layers"] else []
-            if not layers and nearest and nearest.get("material_name"):
-                layers = [{"name": nearest["material_name"], "thickness_m": 0, "inferred_thickness": True}]
-            if nearest: mapped_material_count += 1
-            
-            virtual_fallback_construction = None
+def _add_prepared_zone_to_idf(idf, space: dict, surfaces: list,
+                              geometry_source: str, metadata: dict,
+                              element_cache: list, strtree, report: dict,
+                              all_surfaces: list, surface_names: set,
+                              zone_names: set, zone_info: dict,
+                              construction_cache: dict,
+                              building_min_z: float, building_max_z: float,
+                              elevation_tol: float) -> None:
+    """Create one IDF zone and its in-memory surface records."""
+    zone_name = _unique_name(zone_names, _safe_name(space.get("name"), "Zone_"))
+    idf.newidfobject("ZONE", Name=zone_name, Multiplier=1)
+    bbox = metadata["bbox"]
+
+    floor_area = sum(_polygon_area(s["vertices"]) for s in surfaces if s["role"] == "floor")
+    if floor_area <= 0:
+        floor_area = max((bbox[3] - bbox[0]) * (bbox[4] - bbox[1]), 1.0)
+    volume = float(metadata.get("mesh_volume") or 0.0)
+    if volume < MIN_ZONE_VOLUME:
+        volume = floor_area * max(bbox[5] - bbox[2], DEFAULT_ROOM_HEIGHT_M)
+        report["warnings"].append(
+            f"{zone_name}: volume inferred because no validated closed shell was available"
+        )
+    bbox_volume = max((bbox[3]-bbox[0])*(bbox[4]-bbox[1])*(bbox[5]-bbox[2]), 1e-9)
+
+    zone_surface_records = []
+    mapped_material_count = 0
+    for index, surface in enumerate(surfaces, 1):
+        is_virtual = surface.get("boundary_physical_virtual") == "VIRTUAL"
+        nearest = None if is_virtual else (
+            _nearest_element_indexed(surface, element_cache, strtree) if strtree else None
+        )
+        layers = nearest["layers"] if nearest and nearest["layers"] else []
+        if not layers and nearest and nearest.get("material_name"):
+            layers = [{"name": nearest["material_name"], "thickness_m": 0,
+                       "inferred_thickness": True}]
+        if nearest:
+            mapped_material_count += 1
+
+        virtual_fallback_construction = None
+        if is_virtual:
+            virtual_fallback_construction = _get_or_create_layered_construction(
+                idf, [], surface["role"], construction_cache, report
+            )
+        if is_virtual and report.get("virtual_boundary_construction") == "Construction:AirBoundary":
+            construction_name = "Project_Virtual_Air_Boundary"
+        else:
+            construction_name = _get_or_create_layered_construction(
+                idf, layers, surface["role"], construction_cache, report
+            )
             if is_virtual:
-                virtual_fallback_construction = _get_or_create_layered_construction(
-                    idf, [], surface["role"], construction_cache, report
+                report["warnings"].append(
+                    f"{space['global_id']}: virtual boundary fell back to a generic construction because the selected IDD lacks Construction:AirBoundary"
                 )
-            if is_virtual and report.get("virtual_boundary_construction") == "Construction:AirBoundary":
-                construction_name = "Project_Virtual_Air_Boundary"
-            else:
-                construction_name = _get_or_create_layered_construction(idf, layers, surface["role"], construction_cache, report)
-                if is_virtual:
-                    report["warnings"].append(
-                        f"{space['global_id']}: virtual boundary fell back to a generic construction because the selected IDD lacks Construction:AirBoundary"
-                    )
-            
-            name = _unique_name(surface_names, _safe_name(f"{zone_name}_{surface['surface_type']}_{index}"))
-            mean_z = float(surface["vertices"][:,2].mean())
-            
-            declared_boundary = surface.get("boundary_internal_external", "")
-            if declared_boundary == "EXTERNAL":
-                outside = "Outdoors"
-            elif declared_boundary == "INTERNAL":
-                outside = "Adiabatic"  # replaced with Surface only after safe reciprocal matching
-            elif surface["role"] == "floor":
-                outside = "Ground" if abs(mean_z-building_min_z) <= elevation_tol else "Adiabatic"
-            elif surface["role"] == "roof":
-                outside = "Outdoors" if abs(mean_z-building_max_z) <= elevation_tol else "Adiabatic"
-            else:
-                outside = "Adiabatic"  # lower-tier wall resolved only after adjacency evidence
 
-            record = {**surface, "name": name, "zone_name": zone_name, "construction_name": construction_name, "outside_condition": outside, "outside_object": ""}
-            if virtual_fallback_construction:
-                record["virtual_fallback_construction"] = virtual_fallback_construction
-            if not record.get("source_element"):
-                record["source_element"] = nearest["element"].GlobalId if nearest else None
-            all_surfaces.append(record)
-            zone_surface_records.append(record)
+        name = _unique_name(
+            surface_names, _safe_name(f"{zone_name}_{surface['surface_type']}_{index}")
+        )
+        mean_z = float(surface["vertices"][:, 2].mean())
+        declared_boundary = surface.get("boundary_internal_external", "")
+        if declared_boundary == "EXTERNAL":
+            outside = "Outdoors"
+        elif declared_boundary == "INTERNAL":
+            outside = "Adiabatic"
+        elif surface["role"] == "floor":
+            outside = "Ground" if abs(mean_z-building_min_z) <= elevation_tol else "Adiabatic"
+        elif surface["role"] == "roof":
+            outside = "Outdoors" if abs(mean_z-building_max_z) <= elevation_tol else "Adiabatic"
+        else:
+            outside = "Adiabatic"
 
-        _add_baseline_loads(idf, zone_name, floor_area, space.get("long_name", space.get("name", "")))
-        
-        roles = Counter(s["role"] for s in zone_surface_records)
-        mesh_ratio = min(max(volume / bbox_volume, 0.0), 1.0) if bbox_volume else 0.0
-        material_ratio = mapped_material_count / max(len(zone_surface_records), 1)
-        
-        if geometry_source == "bounding_box_fallback": confidence = "low"
-        elif geometry_source == "ifc_space_boundaries" and metadata.get("boundary_shell_closed") and material_ratio >= 0.5: confidence = "high"
-        elif geometry_source == "mesh_reconstruction" and roles["wall"] >= 3 and roles["floor"] >= 1 and roles["roof"] >= 1 and mesh_ratio >= 0.35 and material_ratio >= 0.5: confidence = "high"
-        else: confidence = "medium"
-            
-        report[f"{confidence}_confidence_zones"] += 1
-        report["zones_created"] += 1
-        
-        zone_info[space["global_id"]] = {"zone_name": zone_name, "floor_area_m2": round(floor_area, 2), "volume_m3": round(volume, 2), "surface_count": len(surfaces), "confidence": confidence, "geometry_source": geometry_source}
-        report["zone_results"].append({
-            "ifc_space_guid": space["global_id"], "zone_name": zone_name,
-            "geometry_source": geometry_source, "confidence": confidence,
-            "watertight_source_mesh": bool(metadata.get("watertight", False)),
-            "boundary_shell_closed": metadata.get("boundary_shell_closed"),
-            "mesh_component_count": metadata.get("mesh_component_count"),
-            "floor_area_m2": round(floor_area, 3), "volume_m3": round(volume, 3),
-            "surface_count": len(surfaces), "material_mapping_ratio": round(material_ratio, 3),
-            "fallback_reason": metadata.get("fallback_reason"),
-        })
+        record = {
+            **surface, "name": name, "zone_name": zone_name,
+            "construction_name": construction_name,
+            "outside_condition": outside, "outside_object": "",
+        }
+        if virtual_fallback_construction:
+            record["virtual_fallback_construction"] = virtual_fallback_construction
+        if not record.get("source_element"):
+            record["source_element"] = nearest["element"].GlobalId if nearest else None
+        all_surfaces.append(record)
+        zone_surface_records.append(record)
 
+    _add_baseline_loads(
+        idf, zone_name, floor_area, space.get("long_name", space.get("name", ""))
+    )
+    roles = Counter(s["role"] for s in zone_surface_records)
+    mesh_ratio = min(max(volume / bbox_volume, 0.0), 1.0) if bbox_volume else 0.0
+    material_ratio = mapped_material_count / max(len(zone_surface_records), 1)
+    if geometry_source == "bounding_box_fallback":
+        confidence = "low"
+    elif (geometry_source == "ifc_space_boundaries"
+          and metadata.get("boundary_shell_closed") and material_ratio >= 0.5):
+        confidence = "high"
+    elif (geometry_source == "mesh_reconstruction" and roles["wall"] >= 3
+          and roles["floor"] >= 1 and roles["roof"] >= 1
+          and mesh_ratio >= 0.35 and material_ratio >= 0.5):
+        confidence = "high"
+    else:
+        confidence = "medium"
+
+    report[f"{confidence}_confidence_zones"] += 1
+    report["zones_created"] += 1
+    zone_info[space["global_id"]] = {
+        "zone_name": zone_name, "floor_area_m2": round(floor_area, 2),
+        "volume_m3": round(volume, 2), "surface_count": len(surfaces),
+        "confidence": confidence, "geometry_source": geometry_source,
+    }
+    report["zone_results"].append({
+        "ifc_space_guid": space["global_id"], "zone_name": zone_name,
+        "geometry_source": geometry_source, "confidence": confidence,
+        "watertight_source_mesh": bool(metadata.get("watertight", False)),
+        "boundary_shell_closed": metadata.get("boundary_shell_closed"),
+        "mesh_component_count": metadata.get("mesh_component_count"),
+        "floor_area_m2": round(floor_area, 3), "volume_m3": round(volume, 3),
+        "surface_count": len(surfaces), "material_mapping_ratio": round(material_ratio, 3),
+        "fallback_reason": metadata.get("fallback_reason"),
+    })
+
+
+def _resolve_conversion_surfaces(ifc, settings, idf, element_cache: list,
+                                 all_surfaces: list, surface_names: set,
+                                 report: dict, coordinate_offset: np.ndarray) -> list:
+    """Resolve adjacency, openings, and construction consistency."""
     adjacency_tolerance, tolerance_source = _derive_adjacency_tolerance(element_cache)
     report["adjacency_plane_tolerance_m"] = round(adjacency_tolerance, 4)
     report["adjacency_tolerance_source"] = tolerance_source
@@ -2663,11 +2704,14 @@ def generate_baseline_idf_from_ifc(ifc, ifc_data: dict):
     openings = _map_openings_to_walls(
         ifc, settings, all_surfaces, surface_names, report, coordinate_offset
     )
-    openings = _prepare_openings_for_energyplus(
-        openings, all_surfaces, surface_names, report
-    )
+    openings = _prepare_openings_for_energyplus(openings, all_surfaces, surface_names, report)
     _prune_unused_constructions(idf, all_surfaces, openings, report)
+    return openings
 
+
+def _validate_conversion_structure(all_surfaces: list, openings: list,
+                                   report: dict) -> None:
+    """Stop before serialization when reciprocal geometry is structurally invalid."""
     structural_validation = _validate_conversion_graph(all_surfaces, openings)
     report["validation"]["pre_serialization_structure"] = structural_validation
     if not structural_validation["passed"]:
@@ -2676,53 +2720,82 @@ def generate_baseline_idf_from_ifc(ifc, ifc_data: dict):
             "Pre-serialization structural validation failed; invalid IDF was not offered: " + summary
         )
 
-    for s in all_surfaces:
-        obj = idf.newidfobject("BUILDINGSURFACE:DETAILED", Name=s["name"], Surface_Type=s["surface_type"], Construction_Name=s["construction_name"], Zone_Name=s["zone_name"], Outside_Boundary_Condition=s["outside_condition"], Sun_Exposure="SunExposed" if s["outside_condition"] == "Outdoors" else "NoSun", Wind_Exposure="WindExposed" if s["outside_condition"] == "Outdoors" else "NoWind")
-        if s.get("outside_object"): obj.Outside_Boundary_Condition_Object = s["outside_object"]
-        obj.Number_of_Vertices = len(s["vertices"])
-        for i, (x, y, z) in enumerate(s["vertices"], 1):
-            setattr(obj, f"Vertex_{i}_Xcoordinate", x); setattr(obj, f"Vertex_{i}_Ycoordinate", y); setattr(obj, f"Vertex_{i}_Zcoordinate", z)
 
-    for o in openings:
-        obj = idf.newidfobject("FENESTRATIONSURFACE:DETAILED", Name=o["name"], Surface_Type=o["surface_type"], Construction_Name=o["construction_name"], Building_Surface_Name=o["parent_name"], Number_of_Vertices=len(o["vertices"]))
-        if o.get("outside_object"):
-            obj.Outside_Boundary_Condition_Object = o["outside_object"]
-        for i, (x, y, z) in enumerate(o["vertices"], 1):
-            setattr(obj, f"Vertex_{i}_Xcoordinate", x); setattr(obj, f"Vertex_{i}_Ycoordinate", y); setattr(obj, f"Vertex_{i}_Zcoordinate", z)
+def _serialize_conversion_geometry(idf, all_surfaces: list, openings: list) -> None:
+    """Write prepared opaque and fenestration surfaces into the IDF model."""
+    for surface in all_surfaces:
+        obj = idf.newidfobject(
+            "BUILDINGSURFACE:DETAILED", Name=surface["name"],
+            Surface_Type=surface["surface_type"],
+            Construction_Name=surface["construction_name"], Zone_Name=surface["zone_name"],
+            Outside_Boundary_Condition=surface["outside_condition"],
+            Sun_Exposure="SunExposed" if surface["outside_condition"] == "Outdoors" else "NoSun",
+            Wind_Exposure="WindExposed" if surface["outside_condition"] == "Outdoors" else "NoWind",
+        )
+        if surface.get("outside_object"):
+            obj.Outside_Boundary_Condition_Object = surface["outside_object"]
+        obj.Number_of_Vertices = len(surface["vertices"])
+        for index, (x, y, z) in enumerate(surface["vertices"], 1):
+            setattr(obj, f"Vertex_{index}_Xcoordinate", x)
+            setattr(obj, f"Vertex_{index}_Ycoordinate", y)
+            setattr(obj, f"Vertex_{index}_Zcoordinate", z)
 
-    idf_path = tempfile.NamedTemporaryFile(suffix="_adaptive_v14.idf", delete=False).name
-    report_path = tempfile.NamedTemporaryFile(suffix="_conversion_report.json", delete=False).name
-    idf.saveas(idf_path)
-    _assert_serialized_schema(idf_path)
+    for opening in openings:
+        obj = idf.newidfobject(
+            "FENESTRATIONSURFACE:DETAILED", Name=opening["name"],
+            Surface_Type=opening["surface_type"], Construction_Name=opening["construction_name"],
+            Building_Surface_Name=opening["parent_name"],
+            Number_of_Vertices=len(opening["vertices"]),
+        )
+        if opening.get("outside_object"):
+            obj.Outside_Boundary_Condition_Object = opening["outside_object"]
+        for index, (x, y, z) in enumerate(opening["vertices"], 1):
+            setattr(obj, f"Vertex_{index}_Xcoordinate", x)
+            setattr(obj, f"Vertex_{index}_Ycoordinate", y)
+            setattr(obj, f"Vertex_{index}_Zcoordinate", z)
+
+
+def _save_generated_idf(idf, report: dict) -> tuple[str, str]:
+    """Assign output-file variables, save the IDF, and verify its schema."""
+    generated_idf_path = tempfile.NamedTemporaryFile(
+        suffix="_adaptive_v14.idf", delete=False
+    ).name
+    generated_report_path = tempfile.NamedTemporaryFile(
+        suffix="_conversion_report.json", delete=False
+    ).name
+    idf.saveas(generated_idf_path)
+    _assert_serialized_schema(generated_idf_path)
     report["validation"]["serialization_schema_9_4"] = {
-        "passed": True,
-        "idd_path": _IDD_ALREADY_SET,
-        "version_object": "9.4",
+        "passed": True, "idd_path": _IDD_ALREADY_SET, "version_object": "9.4",
         "note": "Serialized by eppy using the exact EnergyPlus 9.4 IDD and checked for known newer-schema fields.",
     }
-    
+    return generated_idf_path, generated_report_path
+
+
+def _run_generated_idf_validation(generated_idf_path: str, report: dict,
+                                  weather_file_path: str | None = None) -> None:
+    """Run design-day validation and an optional explicitly assigned EPW file."""
     executable, executable_version = _find_energyplus_executable()
     if executable:
         report["validation"]["energyplus_version"] = executable_version
         report["validation"]["energyplus_executable"] = executable
         design_day = _run_energyplus_case(
-            executable, idf_path, "design_day", ["--design-day"]
+            executable, generated_idf_path, "design_day", ["--design-day"]
         )
         report["validation"]["design_day_run"] = design_day
         report["validation"]["energyplus_run"] = design_day
-
-        epw_path = os.environ.get("ENERGYPLUS_EPW")
-        if epw_path:
-            if Path(epw_path).is_file():
+        if weather_file_path:
+            if Path(weather_file_path).is_file():
                 try:
-                    comparison = _compare_epw_to_ifc(report, epw_path)
+                    comparison = _compare_epw_to_ifc(report, weather_file_path)
                     report["validation"]["weather_file_comparison"] = comparison
                     report["validation"]["weather_run"] = _run_energyplus_case(
-                        executable, idf_path, "weather", ["--weather", epw_path]
+                        executable, generated_idf_path, "weather",
+                        ["--weather", weather_file_path],
                     )
                 except Exception as exc:
                     report["validation"]["weather_file_comparison"] = {
-                        "match": False, "reason": str(exc), "epw_path": epw_path,
+                        "match": False, "reason": str(exc), "epw_path": weather_file_path,
                     }
                     report["validation"]["weather_run"] = {
                         "attempted": False, "passed": False,
@@ -2731,7 +2804,7 @@ def generate_baseline_idf_from_ifc(ifc, ifc_data: dict):
             else:
                 report["validation"]["weather_run"] = {
                     "attempted": False, "passed": False,
-                    "reason": f"ENERGYPLUS_EPW does not exist: {epw_path}",
+                    "reason": f"ENERGYPLUS_EPW does not exist: {weather_file_path}",
                 }
         else:
             report["validation"]["weather_run"] = {
@@ -2749,51 +2822,99 @@ def generate_baseline_idf_from_ifc(ifc, ifc_data: dict):
             "reason": "Exact EnergyPlus 9.4 executable not found",
         }
 
+
+def _apply_research_quality_gate(report: dict) -> None:
+    """Collect every condition that prevents a research-quality pass."""
     run_passed = bool(report["validation"].get("design_day_run", {}).get("passed"))
     quality_failures = []
-    if report.get("design_day", {}).get("source", "").startswith("generic"):
-        quality_failures.append("design-day conditions are generic rather than site-specific")
-    if report["low_confidence_zones"]:
-        quality_failures.append("one or more zones use bounding-box fallback")
-    if report["medium_confidence_zones"]:
-        quality_failures.append("one or more zones did not satisfy every high-confidence criterion")
-    if report["partial_adjacencies_rejected"]:
-        quality_failures.append("one or more partial adjacencies require surface subdivision")
-    if report["dropped_polygon_components"]:
-        quality_failures.append("one or more planar components had unsupported topology and were dropped")
-    if report["clipped_residual_area_m2"] > 0.01:
-        quality_failures.append("adjacency clipping discarded more than 0.01 m2 of residual surface area")
-    if any(z.get("geometry_source") == "ifc_space_boundaries" and not z.get("boundary_shell_closed") for z in report["zone_results"]):
-        quality_failures.append("one or more IFC space-boundary polygon sets are not closed")
-    if report["unknown_walls_kept_adiabatic"]:
-        quality_failures.append("one or more unresolved lower-tier walls were conservatively kept adiabatic")
-    if report["unknown_walls_inferred_outdoors"]:
-        quality_failures.append("one or more wall boundary conditions were inferred as Outdoors")
-    if report["unresolved_declared_internal_surfaces"]:
-        quality_failures.append("one or more IFC-declared internal surfaces lack a reciprocal match")
-    if report["unpaired_virtual_boundaries"]:
-        quality_failures.append("one or more virtual boundaries lack a valid reciprocal pair")
-    if report["invalid_openings_rejected"]:
-        quality_failures.append("one or more openings could not be represented safely")
-    if report["windows_skipped"] or report["doors_skipped"]:
-        quality_failures.append("one or more IFC windows or doors were skipped")
-    if report["material_assumptions"]:
-        quality_failures.append("one or more material thicknesses or thermal properties were inferred")
-    if report["zones_skipped"]:
-        quality_failures.append("one or more IfcSpace objects were skipped")
-    if not run_passed:
-        quality_failures.append("EnergyPlus validation did not pass")
+    checks = [
+        (report.get("design_day", {}).get("source", "").startswith("generic"),
+         "design-day conditions are generic rather than site-specific"),
+        (report["low_confidence_zones"] > 0, "one or more zones use bounding-box fallback"),
+        (report["medium_confidence_zones"] > 0,
+         "one or more zones did not satisfy every high-confidence criterion"),
+        (report["partial_adjacencies_rejected"] > 0,
+         "one or more partial adjacencies require surface subdivision"),
+        (report["dropped_polygon_components"] > 0,
+         "one or more planar components had unsupported topology and were dropped"),
+        (report["clipped_residual_area_m2"] > 0.01,
+         "adjacency clipping discarded more than 0.01 m2 of residual surface area"),
+        (any(z.get("geometry_source") == "ifc_space_boundaries"
+             and not z.get("boundary_shell_closed") for z in report["zone_results"]),
+         "one or more IFC space-boundary polygon sets are not closed"),
+        (report["unknown_walls_kept_adiabatic"] > 0,
+         "one or more unresolved lower-tier walls were conservatively kept adiabatic"),
+        (report["unknown_walls_inferred_outdoors"] > 0,
+         "one or more wall boundary conditions were inferred as Outdoors"),
+        (report["unresolved_declared_internal_surfaces"] > 0,
+         "one or more IFC-declared internal surfaces lack a reciprocal match"),
+        (report["unpaired_virtual_boundaries"] > 0,
+         "one or more virtual boundaries lack a valid reciprocal pair"),
+        (report["invalid_openings_rejected"] > 0,
+         "one or more openings could not be represented safely"),
+        (report["windows_skipped"] > 0 or report["doors_skipped"] > 0,
+         "one or more IFC windows or doors were skipped"),
+        (bool(report["material_assumptions"]),
+         "one or more material thicknesses or thermal properties were inferred"),
+        (report["zones_skipped"] > 0, "one or more IfcSpace objects were skipped"),
+        (not run_passed, "EnergyPlus validation did not pass"),
+    ]
+    quality_failures.extend(message for failed, message in checks if failed)
     weather_comparison = report["validation"].get("weather_file_comparison")
     if weather_comparison and not weather_comparison.get("match"):
-        quality_failures.append("the validation EPW does not match the IFC site within screening thresholds")
+        quality_failures.append(
+            "the validation EPW does not match the IFC site within screening thresholds"
+        )
     report["validation"]["research_quality_gate"] = {
-        "passed": not quality_failures,
-        "failures": quality_failures,
+        "passed": not quality_failures, "failures": quality_failures,
         "meaning": "A pass indicates structural conversion checks only; it is not empirical energy validation.",
     }
 
-    Path(report_path).write_text(json.dumps(report, indent=2), encoding="utf-8")
-    return idf_path, report_path, zone_info, {}, report
+
+def generate_baseline_idf_from_ifc(ifc, ifc_data: dict,
+                                   weather_file_path: str | None = None):
+    """Run the complete IFC-to-IDF workflow by calling focused operations."""
+    weather_file_path = weather_file_path or os.environ.get("ENERGYPLUS_EPW")
+    settings = _new_geometry_settings()
+    native_scale_to_m = _length_scale_to_m(ifc)
+    report = _create_conversion_report(native_scale_to_m)
+    idf = _initialise_idf(ifc, ifc_data, report, native_scale_to_m)
+    element_cache = _build_conversion_element_cache(
+        ifc, settings, native_scale_to_m, report
+    )
+    prepared_zones = _prepare_conversion_zones(
+        ifc, ifc_data, settings, report, native_scale_to_m
+    )
+    (prepared_zones, coordinate_offset, strtree, building_min_z,
+     building_max_z, elevation_tol) = _rebase_conversion_geometry(
+        prepared_zones, element_cache, report
+    )
+
+    all_surfaces = []
+    surface_names = set()
+    zone_names = set()
+    zone_info = {}
+    construction_cache = {}
+
+    for space, surfaces, geometry_source, metadata in prepared_zones:
+        _add_prepared_zone_to_idf(
+            idf, space, surfaces, geometry_source, metadata,
+            element_cache, strtree, report, all_surfaces, surface_names,
+            zone_names, zone_info, construction_cache,
+            building_min_z, building_max_z, elevation_tol,
+        )
+
+    openings = _resolve_conversion_surfaces(
+        ifc, settings, idf, element_cache, all_surfaces,
+        surface_names, report, coordinate_offset,
+    )
+    _validate_conversion_structure(all_surfaces, openings, report)
+    _serialize_conversion_geometry(idf, all_surfaces, openings)
+    generated_idf_path, generated_report_path = _save_generated_idf(idf, report)
+    _run_generated_idf_validation(generated_idf_path, report, weather_file_path)
+    _apply_research_quality_gate(report)
+    Path(generated_report_path).write_text(json.dumps(report, indent=2), encoding="utf-8")
+    return generated_idf_path, generated_report_path, zone_info, {}, report
 
 # =====================================================================
 # SECTION 8 — STREAMLIT UI
@@ -2885,31 +3006,32 @@ def _configure_streamlit_page():
     )
 
 
-def run_streamlit_app():
-    """Run the interactive BIM viewer and IFC-to-IDF converter."""
-    _configure_streamlit_page()
-    if st is None or go is None:
-        raise RuntimeError("Streamlit UI requires the optional 'streamlit' and 'plotly' packages")
-    _render_dashboard_css()
+STREAMLIT_DEFAULT_STATE = {
+    "ifc_data": None,
+    "ifc_traces": None,
+    "space_meta": [],
+    "element_meta": {},
+    "selected_element_gid": None,
+    "active_storeys": None,
+    "active_types": None,
+    "_ifc_key": None,
+    "generated_idf_path": None,
+    "generated_report_path": None,
+    "idf_zone_info": None,
+    "conversion_report": None,
+}
 
-    DEFAULT_STATE = {
-        "ifc_data": None,
-        "ifc_traces": None,
-        "space_meta": [],
-        "element_meta": {},
-        "selected_element_gid": None,
-        "active_storeys": None,
-        "active_types": None,
-        "_ifc_key": None,
-        "generated_idf_path": None,
-        "generated_report_path": None,
-        "idf_zone_info": None,
-        "conversion_report": None,
-    }
-    for key, default_value in DEFAULT_STATE.items():
+
+def _initialise_streamlit_state():
+    """Initialise and return all variables shared between Streamlit reruns."""
+    for key, default_value in STREAMLIT_DEFAULT_STATE.items():
         if key not in st.session_state:
             st.session_state[key] = default_value
-    S = st.session_state
+    return st.session_state
+
+
+def _render_streamlit_header_and_uploader(state):
+    """Render the header and return the uploaded IFC file object."""
 
     st.markdown(
         '<div class="app-header">'
@@ -2923,213 +3045,293 @@ def run_streamlit_app():
     with col_upload:
         st.markdown('<div style="padding-top:10px"><span class="file-label">IFC file</span></div>',
                     unsafe_allow_html=True)
-        ifc_file = st.file_uploader("IFC", type=["ifc"], label_visibility="collapsed", key="ifc_upload_widget")
-        has_file_badge = "on" if S["ifc_data"] else ""
-        if S["ifc_data"]:
-            badge_text = (f"✓ {S['ifc_data']['project']} — "
-                           f"{len(S['ifc_data']['storeys'])} storeys, {len(S['ifc_data']['spaces'])} spaces")
+        uploaded_ifc_file = st.file_uploader(
+            "IFC", type=["ifc"], label_visibility="collapsed", key="ifc_upload_widget"
+        )
+        has_file_badge = "on" if state["ifc_data"] else ""
+        if state["ifc_data"]:
+            badge_text = (f"✓ {state['ifc_data']['project']} — "
+                           f"{len(state['ifc_data']['storeys'])} storeys, "
+                           f"{len(state['ifc_data']['spaces'])} spaces")
         else:
             badge_text = "Drop an IFC file here"
         st.markdown(f'<div class="file-badge {has_file_badge}"><span class="led"></span>{badge_text}</div>',
                     unsafe_allow_html=True)
+    return uploaded_ifc_file
 
-    if ifc_file:
-        file_bytes = ifc_file.getvalue()
-        file_key = hashlib.sha256(file_bytes).hexdigest()
-        if S["_ifc_key"] != file_key:
-            try:
-                with st.spinner("Reading IFC file…"):
-                    parsed = parse_ifc(file_bytes)
-                    storey_names = [s["name"] for s in parsed["storeys"]]
-                    type_labels = sorted(set(VISUAL_IFC_TYPE_LABELS.values()))
-                    traces, spaces, elements = build_3d_traces(parsed["ifc"])
-            except Exception as error:
-                st.error(f"Couldn't read this IFC file: {error}")
-                S["_ifc_key"] = file_key
-                return
-            S["ifc_data"] = parsed
-            S["ifc_traces"] = traces
-            S["space_meta"] = spaces
-            S["element_meta"] = elements
-            S["selected_element_gid"] = None
-            S["active_storeys"] = storey_names[:]
-            S["active_types"] = type_labels[:]
-            S["generated_idf_path"] = None
-            S["generated_report_path"] = None
-            S["idf_zone_info"] = None
-            S["conversion_report"] = None
-            S["_ifc_key"] = file_key
-            st.rerun()
 
-    if not isinstance(S.get("ifc_data"), dict):
-        st.markdown("""
-        <div style="display:flex;flex-direction:column;align-items:center;justify-content:center;
-                    height:60vh;text-align:center;">
-          <div style="font-size:2.6rem;margin-bottom:14px;opacity:0.5">🏗️</div>
-          <div style="font-size:1.05rem;color:#CBD5E1;margin-bottom:6px;font-weight:600;">
-            Drop an <span style="color:#38BDF8">IFC</span> file above to begin
-          </div>
-        </div>
-        """, unsafe_allow_html=True)
-        return
+def _reset_generated_outputs(state) -> None:
+    """Clear outputs that belong to a previously uploaded IFC file."""
+    state["generated_idf_path"] = None
+    state["generated_report_path"] = None
+    state["idf_zone_info"] = None
+    state["conversion_report"] = None
 
-    ifc_d = S["ifc_data"]
-    storey_names = [s["name"] for s in ifc_d["storeys"]]
-    all_type_labels = sorted(set(VISUAL_IFC_TYPE_LABELS.values()))
 
+def _process_uploaded_ifc(uploaded_ifc_file, state) -> bool:
+    """Assign uploaded IFC bytes to variables, parse them, and cache visual data."""
+    if uploaded_ifc_file is None:
+        return True
+    ifc_file_bytes = uploaded_ifc_file.getvalue()
+    ifc_file_key = hashlib.sha256(ifc_file_bytes).hexdigest()
+    if state["_ifc_key"] == ifc_file_key:
+        return True
+    try:
+        with st.spinner("Reading IFC file…"):
+            parsed_ifc_data = parse_ifc(ifc_file_bytes)
+            storey_names = [storey["name"] for storey in parsed_ifc_data["storeys"]]
+            type_labels = sorted(set(VISUAL_IFC_TYPE_LABELS.values()))
+            traces, spaces, elements = build_3d_traces(parsed_ifc_data["ifc"])
+    except Exception as error:
+        st.error(f"Couldn't read this IFC file: {error}")
+        state["_ifc_key"] = ifc_file_key
+        return False
+
+    state["ifc_data"] = parsed_ifc_data
+    state["ifc_traces"] = traces
+    state["space_meta"] = spaces
+    state["element_meta"] = elements
+    state["selected_element_gid"] = None
+    state["active_storeys"] = storey_names[:]
+    state["active_types"] = type_labels[:]
+    _reset_generated_outputs(state)
+    state["_ifc_key"] = ifc_file_key
+    st.rerun()
+    return True
+
+
+def _render_empty_ifc_state() -> None:
+    """Render the upload prompt shown before an IFC model is available."""
+    st.markdown("""
+    <div style="display:flex;flex-direction:column;align-items:center;justify-content:center;
+                height:60vh;text-align:center;">
+      <div style="font-size:2.6rem;margin-bottom:14px;opacity:0.5">🏗️</div>
+      <div style="font-size:1.05rem;color:#CBD5E1;margin-bottom:6px;font-weight:600;">
+        Drop an <span style="color:#38BDF8">IFC</span> file above to begin
+      </div>
+    </div>
+    """, unsafe_allow_html=True)
+
+
+def _render_filter_controls(state, storey_names: list,
+                            all_type_labels: list) -> tuple[list, list]:
+    """Render floor/type filters and return their effective selected values."""
     col_a, col_b, col_c, col_d = st.columns([0.3, 1.8, 0.28, 3.5], gap="small")
     with col_a:
-        st.markdown('<div class="fbar-label" style="padding-top:8px">Floor</div>', unsafe_allow_html=True)
+        st.markdown('<div class="fbar-label" style="padding-top:8px">Floor</div>',
+                    unsafe_allow_html=True)
     with col_b:
         picked_storeys = st.multiselect(
             "floors", options=storey_names,
-            default=[s for s in (S["active_storeys"] or storey_names) if s in storey_names],
+            default=[s for s in (state["active_storeys"] or storey_names) if s in storey_names],
             label_visibility="collapsed", key="floor_filter_widget",
         )
     with col_c:
-        st.markdown('<div class="fbar-label" style="padding-top:8px">Types</div>', unsafe_allow_html=True)
+        st.markdown('<div class="fbar-label" style="padding-top:8px">Types</div>',
+                    unsafe_allow_html=True)
     with col_d:
         picked_types = st.multiselect(
             "types", options=all_type_labels,
-            default=[t for t in (S["active_types"] or all_type_labels) if t in all_type_labels],
+            default=[t for t in (state["active_types"] or all_type_labels) if t in all_type_labels],
             label_visibility="collapsed", key="type_filter_widget",
         )
-
     effective_storeys = picked_storeys if picked_storeys else storey_names
     effective_types = picked_types if picked_types else all_type_labels
-    if (set(effective_storeys) != set(S["active_storeys"] or []) or
-            set(effective_types) != set(S["active_types"] or [])):
-        with st.spinner(f"Filtering — {len(effective_storeys)} floor(s), {len(effective_types)} type(s)…"):
-            traces, spaces, elements = build_3d_traces(
-                ifc_d["ifc"],
-                storey_filter=effective_storeys if set(effective_storeys) != set(storey_names) else None,
-                type_filter=effective_types if set(effective_types) != set(all_type_labels) else None,
-            )
-            S["ifc_traces"] = traces
-            S["space_meta"] = spaces
-            S["element_meta"] = elements
-            S["active_storeys"] = effective_storeys[:]
-            S["active_types"] = effective_types[:]
-        st.rerun()
+    return effective_storeys, effective_types
 
+
+def _apply_visual_filters(ifc_data: dict, state, storey_names: list,
+                          all_type_labels: list, effective_storeys: list,
+                          effective_types: list) -> None:
+    """Rebuild IFC display meshes only when a filter variable changes."""
+    filters_changed = (
+        set(effective_storeys) != set(state["active_storeys"] or [])
+        or set(effective_types) != set(state["active_types"] or [])
+    )
+    if not filters_changed:
+        return
+    with st.spinner(
+        f"Filtering — {len(effective_storeys)} floor(s), {len(effective_types)} type(s)…"
+    ):
+        traces, spaces, elements = build_3d_traces(
+            ifc_data["ifc"],
+            storey_filter=(effective_storeys
+                           if set(effective_storeys) != set(storey_names) else None),
+            type_filter=(effective_types
+                         if set(effective_types) != set(all_type_labels) else None),
+        )
+        state["ifc_traces"] = traces
+        state["space_meta"] = spaces
+        state["element_meta"] = elements
+        state["active_storeys"] = effective_storeys[:]
+        state["active_types"] = effective_types[:]
+    st.rerun()
+
+
+def _render_project_summary(ifc_data: dict, state) -> None:
+    """Render the project/storey/space/mesh summary strip."""
     st.markdown(
         f'<div class="sstrip">'
-        f'<div class="sstat">Project: <b>{ifc_d["project"]}</b></div>'
-        f'<div class="sstat">Storeys: <b>{len(ifc_d["storeys"])}</b></div>'
-        f'<div class="sstat">Spaces: <b>{len(ifc_d["spaces"])}</b></div>'
-        f'<div class="sstat">Meshes: <b>{len(S["ifc_traces"] or []):,}</b></div>'
+        f'<div class="sstat">Project: <b>{ifc_data["project"]}</b></div>'
+        f'<div class="sstat">Storeys: <b>{len(ifc_data["storeys"])}</b></div>'
+        f'<div class="sstat">Spaces: <b>{len(ifc_data["spaces"])}</b></div>'
+        f'<div class="sstat">Meshes: <b>{len(state["ifc_traces"] or []):,}</b></div>'
         '</div>', unsafe_allow_html=True,
     )
 
+
+def _run_streamlit_conversion(ifc_data: dict, state,
+                              weather_file_path: str | None) -> None:
+    """Render the generate control and call the converter on assigned inputs."""
     col_gen_button, col_gen_caption = st.columns([1.4, 3.6], gap="small")
     with col_gen_button:
         generate_clicked = st.button("⚡ Generate IDF from IFC", use_container_width=True)
     with col_gen_caption:
         st.caption("Runs the v14 adaptive space-boundary, adjacency, material, opening, confidence, and validation pipeline.")
-
-    if generate_clicked:
-        with st.spinner("Executing Physics & Geometry…"):
-            try:
-                idf_path, report_path, zone_info, _, report = generate_baseline_idf_from_ifc(ifc_d["ifc"], ifc_d)
-                S["generated_idf_path"] = idf_path
-                S["generated_report_path"] = report_path
-                S["idf_zone_info"] = zone_info
-                S["conversion_report"] = report
-                st.success(f"Generated {report['zones_created']} Zones. {report['shared_surfaces_matched']} interior pairs matched.")
-                gate = report.get("validation", {}).get("research_quality_gate", {})
-                if not gate.get("passed"):
-                    st.warning("Research quality gate failed: " + "; ".join(gate.get("failures", [])))
-            except Exception:
-                st.error(f"Generation Failed: {traceback.format_exc()}")
-
-    if S.get("generated_idf_path"):
-        col_idf, col_report = st.columns(2)
-        with col_idf:
-            st.download_button("⬇ Download generated IDF", Path(S["generated_idf_path"]).read_text(),
-                               file_name="baseline_v14.idf", use_container_width=True)
-        with col_report:
-            st.download_button("⬇ Download conversion report", Path(S["generated_report_path"]).read_text(),
-                               file_name="report_v14.json", use_container_width=True)
-
-    if not S["ifc_traces"]:
-        st.warning("No displayable meshes were found for the current filters.")
+    if not generate_clicked:
         return
+    with st.spinner("Executing Physics & Geometry…"):
+        try:
+            (generated_idf_path, generated_report_path, zone_info, _,
+             report) = generate_baseline_idf_from_ifc(
+                ifc_data["ifc"], ifc_data, weather_file_path
+            )
+            state["generated_idf_path"] = generated_idf_path
+            state["generated_report_path"] = generated_report_path
+            state["idf_zone_info"] = zone_info
+            state["conversion_report"] = report
+            st.success(
+                f"Generated {report['zones_created']} Zones. "
+                f"{report['shared_surfaces_matched']} interior pairs matched."
+            )
+            gate = report.get("validation", {}).get("research_quality_gate", {})
+            if not gate.get("passed"):
+                st.warning("Research quality gate failed: " + "; ".join(gate.get("failures", [])))
+        except Exception:
+            st.error(f"Generation Failed: {traceback.format_exc()}")
 
-    space_meta = S.get("space_meta") or []
-    element_meta = S.get("element_meta") or {}
-    if element_meta:
-        NONE_LABEL = "— none selected —"
 
-        def make_label(metadata):
-            display_name = metadata.get("long_name") or metadata["name"]
-            return f"{metadata['label']} · {display_name} ({metadata['storey']})"
+def _render_output_downloads(state) -> None:
+    """Read assigned output files and render their download buttons."""
+    generated_idf_path = state.get("generated_idf_path")
+    generated_report_path = state.get("generated_report_path")
+    if not generated_idf_path:
+        return
+    col_idf, col_report = st.columns(2)
+    with col_idf:
+        st.download_button(
+            "⬇ Download generated IDF", Path(generated_idf_path).read_text(),
+            file_name="baseline_v14.idf", use_container_width=True,
+        )
+    with col_report:
+        st.download_button(
+            "⬇ Download conversion report", Path(generated_report_path).read_text(),
+            file_name="report_v14.json", use_container_width=True,
+        )
 
-        label_use_count = Counter(make_label(metadata) for metadata in element_meta.values())
-        label_to_id = {NONE_LABEL: None}
-        id_to_label = {}
-        for gid, metadata in element_meta.items():
-            base_label = make_label(metadata)
-            final_label = base_label if label_use_count[base_label] == 1 else f"{base_label} [{gid[-6:]}]"
-            label_to_id[final_label] = gid
-            id_to_label[gid] = final_label
-        dropdown_options = [NONE_LABEL] + sorted(label for label in label_to_id if label != NONE_LABEL)
-        currently_selected_label = id_to_label.get(S["selected_element_gid"], NONE_LABEL)
-        current_index = dropdown_options.index(currently_selected_label) if currently_selected_label in dropdown_options else 0
-        col_find_label, col_find_box = st.columns([0.3, 4], gap="small")
-        with col_find_label:
-            st.markdown('<div class="fbar-label" style="padding-top:8px">Find</div>', unsafe_allow_html=True)
-        with col_find_box:
-            chosen_label = st.selectbox("find_element", dropdown_options, index=current_index,
-                                        label_visibility="collapsed", key="find_element_widget")
-        S["selected_element_gid"] = label_to_id.get(chosen_label)
 
+def _element_dropdown_label(metadata: dict) -> str:
+    """Create a human-readable element label for the Find dropdown."""
+    display_name = metadata.get("long_name") or metadata["name"]
+    return f"{metadata['label']} · {display_name} ({metadata['storey']})"
+
+
+def _render_element_selector(element_meta: dict, state) -> None:
+    """Render the searchable element selector and store the selected GUID."""
+    if not element_meta:
+        return
+    none_label = "— none selected —"
+    label_use_count = Counter(_element_dropdown_label(item) for item in element_meta.values())
+    label_to_id = {none_label: None}
+    id_to_label = {}
+    for global_id, metadata in element_meta.items():
+        base_label = _element_dropdown_label(metadata)
+        final_label = (base_label if label_use_count[base_label] == 1
+                       else f"{base_label} [{global_id[-6:]}]")
+        label_to_id[final_label] = global_id
+        id_to_label[global_id] = final_label
+    dropdown_options = [none_label] + sorted(
+        label for label in label_to_id if label != none_label
+    )
+    selected_label = id_to_label.get(state["selected_element_gid"], none_label)
+    current_index = dropdown_options.index(selected_label) if selected_label in dropdown_options else 0
+    col_find_label, col_find_box = st.columns([0.3, 4], gap="small")
+    with col_find_label:
+        st.markdown('<div class="fbar-label" style="padding-top:8px">Find</div>',
+                    unsafe_allow_html=True)
+    with col_find_box:
+        chosen_label = st.selectbox(
+            "find_element", dropdown_options, index=current_index,
+            label_visibility="collapsed", key="find_element_widget",
+        )
+    state["selected_element_gid"] = label_to_id.get(chosen_label)
+
+
+def _build_space_marker_trace(space_meta: list, selected_global_id: str | None,
+                              zone_info: dict | None):
+    """Build the Plotly marker/text trace used to identify IFC spaces."""
+    dot_x, dot_y, dot_z, dot_color, dot_size, dot_text, dot_hover = [], [], [], [], [], [], []
+    for space in space_meta:
+        dot_x.append(space["centroid"][0])
+        dot_y.append(space["centroid"][1])
+        dot_z.append(space["centroid"][2])
+        is_selected = space["global_id"] == selected_global_id
+        dot_color.append("#FFE040" if is_selected else "#FF2222")
+        dot_size.append(28 if is_selected else 22)
+        display_name = space.get("long_name") or space["name"]
+        dot_text.append(display_name)
+        zone = zone_info.get(space["global_id"]) if zone_info else None
+        zone_line = ""
+        if zone:
+            zone_line = (f"<br><b>IDF Zone:</b> {zone['zone_name']}<br>"
+                         f"Floor area: {zone['floor_area_m2']} m² · Volume: {zone['volume_m3']} m³<br>"
+                         f"Confidence: {zone['confidence']} · Source: {zone['geometry_source']}")
+        dot_hover.append(
+            f"<b>{display_name}</b><br><b>Floor:</b> {space['storey']}<br>"
+            f"<span style='color:#9CA3AF'>{space['global_id']}</span>{zone_line}"
+        )
+    return go.Scatter3d(
+        x=dot_x, y=dot_y, z=dot_z, mode="markers+text",
+        marker=dict(size=dot_size, color=dot_color, symbol="circle", opacity=1.0,
+                    line=dict(color="#FFFFFF", width=2.5)),
+        text=dot_text, textposition="top center",
+        textfont=dict(color="#FFFFFF", size=9, family="monospace"),
+        hovertemplate="%{customdata}<extra></extra>", customdata=dot_hover,
+        name="Spaces", legendgroup="Spaces", showlegend=True,
+    )
+
+
+def _build_plotly_viewer_traces(state) -> list:
+    """Convert cached mesh dictionaries into Plotly trace objects."""
     plotly_traces = []
-    for trace_data in copy.deepcopy(S["ifc_traces"]):
+    selected_global_id = state["selected_element_gid"]
+    for trace_data in copy.deepcopy(state["ifc_traces"]):
         trace_data.pop("type", None)
-        this_gid = trace_data.pop("global_id", None)
-        if this_gid and this_gid == S["selected_element_gid"]:
+        this_global_id = trace_data.pop("global_id", None)
+        if this_global_id and this_global_id == selected_global_id:
             trace_data["color"] = "#FFE040"
             trace_data["opacity"] = 0.85
         plotly_traces.append(go.Mesh3d(**trace_data))
-
+    space_meta = state.get("space_meta") or []
     if space_meta:
-        dot_x, dot_y, dot_z, dot_color, dot_size, dot_text, dot_hover = [], [], [], [], [], [], []
-        all_zone_info_for_hover = S.get("idf_zone_info")
-        for space in space_meta:
-            dot_x.append(space["centroid"][0])
-            dot_y.append(space["centroid"][1])
-            dot_z.append(space["centroid"][2])
-            is_selected = space["global_id"] == S["selected_element_gid"]
-            dot_color.append("#FFE040" if is_selected else "#FF2222")
-            dot_size.append(28 if is_selected else 22)
-            display_name = space.get("long_name") or space["name"]
-            dot_text.append(display_name)
-            zone = all_zone_info_for_hover.get(space["global_id"]) if all_zone_info_for_hover else None
-            zone_line = ""
-            if zone:
-                zone_line = (f"<br><b>IDF Zone:</b> {zone['zone_name']}<br>"
-                             f"Floor area: {zone['floor_area_m2']} m² · Volume: {zone['volume_m3']} m³<br>"
-                             f"Confidence: {zone['confidence']} · Source: {zone['geometry_source']}")
-            dot_hover.append(f"<b>{display_name}</b><br><b>Floor:</b> {space['storey']}<br>"
-                             f"<span style='color:#9CA3AF'>{space['global_id']}</span>{zone_line}")
-        plotly_traces.append(go.Scatter3d(
-            x=dot_x, y=dot_y, z=dot_z, mode="markers+text",
-            marker=dict(size=dot_size, color=dot_color, symbol="circle", opacity=1.0,
-                        line=dict(color="#FFFFFF", width=2.5)),
-            text=dot_text, textposition="top center", textfont=dict(color="#FFFFFF", size=9, family="monospace"),
-            hovertemplate="%{customdata}<extra></extra>", customdata=dot_hover,
-            name="Spaces", legendgroup="Spaces", showlegend=True,
+        plotly_traces.append(_build_space_marker_trace(
+            space_meta, selected_global_id, state.get("idf_zone_info")
         ))
+    return plotly_traces
 
+
+def _render_3d_viewer(plotly_traces: list, raw_ifc_traces: list) -> None:
+    """Render the Plotly scene and its material/type legend."""
     figure = go.Figure(data=plotly_traces)
     figure.update_layout(**_scene_layout(height=650))
     col_viewer, col_legend = st.columns([4, 1], gap="medium")
     with col_viewer:
         st.plotly_chart(figure, use_container_width=True, config={"displaylogo": False})
     with col_legend:
-        st.markdown('<div class="fbar-label" style="margin-bottom:6px;">Legend</div>', unsafe_allow_html=True)
+        st.markdown('<div class="fbar-label" style="margin-bottom:6px;">Legend</div>',
+                    unsafe_allow_html=True)
         seen_legend = {}
-        for trace in S["ifc_traces"]:
+        for trace in raw_ifc_traces:
             if trace.get("name", "?") not in seen_legend:
                 seen_legend[trace.get("name", "?")] = trace.get("color", "#888")
         legend_rows_html = "".join(
@@ -3139,71 +3341,153 @@ def run_streamlit_app():
         )
         st.markdown(legend_rows_html, unsafe_allow_html=True)
 
-    selected_gid = S["selected_element_gid"]
-    selected_element = element_meta.get(selected_gid) if selected_gid else None
-    if selected_element:
-        display_name = selected_element.get("long_name") or selected_element["name"]
-        material_suffix = f" · {selected_element['material']}" if selected_element.get("material") else ""
+
+def _render_selected_element_details(element_meta: dict, state) -> None:
+    """Render IFC metadata and generated zone data for the current selection."""
+    selected_global_id = state["selected_element_gid"]
+    selected_element = element_meta.get(selected_global_id) if selected_global_id else None
+    if not selected_element:
+        return
+    display_name = selected_element.get("long_name") or selected_element["name"]
+    material_suffix = f" · {selected_element['material']}" if selected_element.get("material") else ""
+    st.markdown(
+        f'<div class="sel-overlay"><b>▶ {display_name}</b>&nbsp;&nbsp;·&nbsp;&nbsp;'
+        f'{selected_element["label"]}&nbsp;&nbsp;·&nbsp;&nbsp;{selected_element["storey"]}{material_suffix}'
+        f'<br><span class="sel-gid">{selected_element["global_id"]}</span></div>',
+        unsafe_allow_html=True,
+    )
+    if selected_element["ifc_type"] != "IfcSpace":
+        return
+    zone = (state.get("idf_zone_info") or {}).get(selected_global_id)
+    if zone:
         st.markdown(
-            f'<div class="sel-overlay"><b>▶ {display_name}</b>&nbsp;&nbsp;·&nbsp;&nbsp;'
-            f'{selected_element["label"]}&nbsp;&nbsp;·&nbsp;&nbsp;{selected_element["storey"]}{material_suffix}'
-            f'<br><span class="sel-gid">{selected_element["global_id"]}</span></div>',
+            f'<div class="sel-overlay" style="background:#082F49;border-color:#0EA5E9;">'
+            f'<b>⚡ IDF Zone: {zone["zone_name"]}</b><br>'
+            f'Floor area: <b>{zone["floor_area_m2"]} m²</b>&nbsp;&nbsp;·&nbsp;&nbsp;'
+            f'Volume: <b>{zone["volume_m3"]} m³</b>&nbsp;&nbsp;·&nbsp;&nbsp;'
+            f'Surfaces: <b>{zone["surface_count"]}</b><br>'
+            f'Confidence: <b>{zone["confidence"]}</b>&nbsp;&nbsp;·&nbsp;&nbsp;'
+            f'Geometry source: <b>{zone["geometry_source"]}</b></div>',
             unsafe_allow_html=True,
         )
-        if selected_element["ifc_type"] == "IfcSpace":
-            zone = (S.get("idf_zone_info") or {}).get(selected_gid)
-            if zone:
-                st.markdown(
-                    f'<div class="sel-overlay" style="background:#082F49;border-color:#0EA5E9;">'
-                    f'<b>⚡ IDF Zone: {zone["zone_name"]}</b><br>'
-                    f'Floor area: <b>{zone["floor_area_m2"]} m²</b>&nbsp;&nbsp;·&nbsp;&nbsp;'
-                    f'Volume: <b>{zone["volume_m3"]} m³</b>&nbsp;&nbsp;·&nbsp;&nbsp;'
-                    f'Surfaces: <b>{zone["surface_count"]}</b><br>'
-                    f'Confidence: <b>{zone["confidence"]}</b>&nbsp;&nbsp;·&nbsp;&nbsp;'
-                    f'Geometry source: <b>{zone["geometry_source"]}</b></div>', unsafe_allow_html=True,
-                )
-                with st.expander("Zone data as JSON"):
-                    st.json(zone)
-            elif S.get("idf_zone_info") is not None:
-                st.caption("No IDF zone was generated for this space.")
+        with st.expander("Zone data as JSON"):
+            st.json(zone)
+    elif state.get("idf_zone_info") is not None:
+        st.caption("No IDF zone was generated for this space.")
 
 
-def run_headless(ifc_path: str, idf_output: str, report_output: str) -> dict:
-    """Batch conversion API used by validation corpora and CI pipelines."""
-    source = Path(ifc_path)
-    if not source.is_file():
-        raise FileNotFoundError(f"IFC input not found: {source}")
-    parsed = parse_ifc(source.read_bytes())
-    generated_idf, generated_report, _, _, report = generate_baseline_idf_from_ifc(
-        parsed["ifc"], parsed
+def run_streamlit_app():
+    """Run the UI by assigning input variables and calling focused functions."""
+    _configure_streamlit_page()
+    if st is None or go is None:
+        raise RuntimeError("Streamlit UI requires the optional 'streamlit' and 'plotly' packages")
+    _render_dashboard_css()
+    state = _initialise_streamlit_state()
+
+    uploaded_ifc_file = _render_streamlit_header_and_uploader(state)
+    if not _process_uploaded_ifc(uploaded_ifc_file, state):
+        return
+    if not isinstance(state.get("ifc_data"), dict):
+        _render_empty_ifc_state()
+        return
+
+    ifc_data = state["ifc_data"]
+    weather_file_path = os.environ.get("ENERGYPLUS_EPW")
+    storey_names = [storey["name"] for storey in ifc_data["storeys"]]
+    all_type_labels = sorted(set(VISUAL_IFC_TYPE_LABELS.values()))
+    effective_storeys, effective_types = _render_filter_controls(
+        state, storey_names, all_type_labels
     )
-    idf_target = Path(idf_output)
-    report_target = Path(report_output)
-    idf_target.parent.mkdir(parents=True, exist_ok=True)
-    report_target.parent.mkdir(parents=True, exist_ok=True)
-    shutil.copyfile(generated_idf, idf_target)
-    shutil.copyfile(generated_report, report_target)
+    _apply_visual_filters(
+        ifc_data, state, storey_names, all_type_labels,
+        effective_storeys, effective_types,
+    )
+    _render_project_summary(ifc_data, state)
+    _run_streamlit_conversion(ifc_data, state, weather_file_path)
+    _render_output_downloads(state)
+
+    if not state["ifc_traces"]:
+        st.warning("No displayable meshes were found for the current filters.")
+        return
+    element_meta = state.get("element_meta") or {}
+    _render_element_selector(element_meta, state)
+    plotly_traces = _build_plotly_viewer_traces(state)
+    _render_3d_viewer(plotly_traces, state["ifc_traces"])
+    _render_selected_element_details(element_meta, state)
+
+
+def _assigned_input_path(file_path: str, label: str) -> Path:
+    """Assign and validate one input data-file path."""
+    assigned_path = Path(file_path)
+    if not assigned_path.is_file():
+        raise FileNotFoundError(f"{label} input not found: {assigned_path}")
+    return assigned_path
+
+
+def _copy_conversion_outputs(generated_idf_path: str, generated_report_path: str,
+                             idf_output_path: Path, report_output_path: Path) -> None:
+    """Copy generated temporary files to the assigned output variables."""
+    idf_output_path.parent.mkdir(parents=True, exist_ok=True)
+    report_output_path.parent.mkdir(parents=True, exist_ok=True)
+    shutil.copyfile(generated_idf_path, idf_output_path)
+    shutil.copyfile(generated_report_path, report_output_path)
+
+
+def run_headless(ifc_path: str, idf_output: str, report_output: str,
+                 weather_path: str | None = None) -> dict:
+    """Run batch conversion using explicitly assigned input/output file variables."""
+    ifc_input_path = _assigned_input_path(ifc_path, "IFC")
+    weather_input_path = (
+        _assigned_input_path(weather_path, "EPW") if weather_path else None
+    )
+    idf_output_path = Path(idf_output)
+    report_output_path = Path(report_output)
+
+    ifc_file_bytes = ifc_input_path.read_bytes()
+    parsed_ifc_data = parse_ifc(ifc_file_bytes)
+    (generated_idf_path, generated_report_path, _, _,
+     report) = generate_baseline_idf_from_ifc(
+        parsed_ifc_data["ifc"], parsed_ifc_data,
+        str(weather_input_path) if weather_input_path else None,
+    )
+    _copy_conversion_outputs(
+        generated_idf_path, generated_report_path,
+        idf_output_path, report_output_path,
+    )
     return report
 
 
 def _cli_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Adaptive IFC-to-IDF converter")
     parser.add_argument("--ifc", help="Input IFC file; omit to start the Streamlit UI")
+    parser.add_argument(
+        "--weather",
+        default=os.environ.get("ENERGYPLUS_EPW"),
+        help="Optional EPW input file (defaults to ENERGYPLUS_EPW)",
+    )
     parser.add_argument("--idf-output", default="baseline.idf", help="Output IDF path")
     parser.add_argument("--report-output", default="conversion_report.json", help="Output JSON report path")
     return parser
 
 
 def main(argv=None):
-    """Select batch conversion or the Streamlit application from CLI arguments."""
+    """Assign file variables and call either batch or Streamlit functions."""
     args = _cli_parser().parse_args(argv)
-    if args.ifc:
-        result = run_headless(args.ifc, args.idf_output, args.report_output)
+    ifc_input_file = args.ifc
+    weather_input_file = args.weather
+    idf_output_file = args.idf_output
+    report_output_file = args.report_output
+
+    if ifc_input_file:
+        result = run_headless(
+            ifc_input_file, idf_output_file, report_output_file,
+            weather_input_file,
+        )
         print(json.dumps({
             "zones_created": result["zones_created"],
             "quality_gate": result["validation"]["research_quality_gate"],
-            "idf": str(Path(args.idf_output).resolve()),
-            "report": str(Path(args.report_output).resolve()),
+            "idf": str(Path(idf_output_file).resolve()),
+            "report": str(Path(report_output_file).resolve()),
         }, indent=2))
     else:
         run_streamlit_app()
