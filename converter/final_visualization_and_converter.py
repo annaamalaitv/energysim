@@ -144,6 +144,19 @@ TARGET_ENERGYPLUS_RELEASE = "26.1.0"
 
 _IDD_ALREADY_SET = None
 
+
+class NoUsableGeometryError(ValueError):
+    """Raised when an IFC file has no convertible IfcSpace geometry.
+
+    Carries the partially-built conversion report so callers (headless/CI,
+    the Streamlit UI) can surface a structured diagnostic instead of a bare
+    traceback.
+    """
+
+    def __init__(self, message: str, report: dict):
+        super().__init__(message)
+        self.report = report
+
 # =====================================================================
 # SECTION 2 — CORE IFC PARSING
 # =====================================================================
@@ -1091,12 +1104,28 @@ def _get_or_create_layered_construction(idf, layers: list, role: str, cache: dic
             thickness = DEFAULT_LAYER_THICKNESS.get(role, 0.20) / max(len(layers), 1)
         keyword, props, inferred_properties = _match_material_props(layer.get("name", ""))
         authored = layer.get("thermal_props") or {}
-        if all(authored.get(key) is not None for key in ("conductivity", "density", "specific_heat")):
+        # Only trust authored IFC values when every one of them is present AND
+        # physically plausible (>0). Some authoring tools (older ArchiCAD/DDS
+        # IFC exports in particular) emit explicit 0 as a placeholder rather
+        # than omitting the property; blindly trusting that would produce an
+        # EnergyPlus Material with zero conductivity/density/specific heat,
+        # which EnergyPlus rejects outright. Fall through to the safe
+        # keyword-based table in that case instead.
+        authored_valid = all(
+            isinstance(authored.get(key), (int, float)) and math.isfinite(authored[key]) and authored[key] > 0
+            for key in ("conductivity", "density", "specific_heat")
+        )
+        if authored_valid:
             props = (
                 props[0], float(authored["conductivity"]),
                 float(authored["density"]), float(authored["specific_heat"]),
             )
             inferred_properties = False
+        elif any(authored.get(key) is not None for key in ("conductivity", "density", "specific_heat")):
+            report.setdefault("warnings", []).append(
+                f"{layer.get('name', 'Generic')}: authored IFC material properties present but implausible "
+                "(<=0 or non-numeric); used keyword-based defaults instead"
+            )
         normalized.append((layer.get("name", "Generic"), thickness, keyword, props, inferred_thickness, inferred_properties))
 
     cache_key = (role, tuple((row[2], round(row[1], 5), tuple(round(float(v), 6) if isinstance(v, (int, float)) else v for v in row[3])) for row in normalized))
@@ -2538,7 +2567,22 @@ def generate_baseline_idf_from_ifc(ifc, ifc_data: dict):
             report["zones_skipped"] += 1
             report["warnings"].append(f"Space geometry failed {space['global_id']}: {str(e)}")
 
-    if not prepared_zones: raise ValueError("No usable IfcSpace geometry converted.")
+    if not prepared_zones:
+        space_count = len(ifc_data.get("spaces", []))
+        report["zones_created"] = 0
+        report["validation"] = {
+            "passed": False,
+            "errors": [
+                f"No usable IfcSpace geometry converted ({space_count} IfcSpace "
+                "entities present in source file). No explicit space-boundary "
+                "geometry, watertight IfcSpace mesh, or safe bounding-box "
+                "fallback could be built for any zone."
+            ],
+        }
+        raise NoUsableGeometryError(
+            f"No usable IfcSpace geometry converted ({space_count} IfcSpace entities in source).",
+            report,
+        )
 
     original_min = np.array([
         min(meta["bbox"][0] for _, _, _, meta in prepared_zones),
@@ -3207,13 +3251,21 @@ def run_headless(ifc_path: str, idf_output: str, report_output: str) -> dict:
     if not source.is_file():
         raise FileNotFoundError(f"IFC input not found: {source}")
     parsed = parse_ifc(source.read_bytes())
-    generated_idf, generated_report, _, _, report = generate_baseline_idf_from_ifc(
-        parsed["ifc"], parsed
-    )
-    idf_target = Path(idf_output)
     report_target = Path(report_output)
-    idf_target.parent.mkdir(parents=True, exist_ok=True)
     report_target.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        generated_idf, generated_report, _, _, report = generate_baseline_idf_from_ifc(
+            parsed["ifc"], parsed
+        )
+    except NoUsableGeometryError as exc:
+        report = exc.report
+        report["zones_created"] = 0
+        report["conversion_failed"] = True
+        report["failure_reason"] = str(exc)
+        report_target.write_text(json.dumps(report, indent=2))
+        raise
+    idf_target = Path(idf_output)
+    idf_target.parent.mkdir(parents=True, exist_ok=True)
     shutil.copyfile(generated_idf, idf_target)
     shutil.copyfile(generated_report, report_target)
     return report
@@ -3230,12 +3282,21 @@ def _cli_parser() -> argparse.ArgumentParser:
 if __name__ == "__main__":
     args = _cli_parser().parse_args()
     if args.ifc:
-        result = run_headless(args.ifc, args.idf_output, args.report_output)
-        print(json.dumps({
-            "zones_created": result["zones_created"],
-            "quality_gate": result["validation"]["research_quality_gate"],
-            "idf": str(Path(args.idf_output).resolve()),
-            "report": str(Path(args.report_output).resolve()),
-        }, indent=2))
+        try:
+            result = run_headless(args.ifc, args.idf_output, args.report_output)
+            print(json.dumps({
+                "zones_created": result["zones_created"],
+                "quality_gate": result["validation"]["research_quality_gate"],
+                "idf": str(Path(args.idf_output).resolve()),
+                "report": str(Path(args.report_output).resolve()),
+            }, indent=2))
+        except NoUsableGeometryError as exc:
+            print(json.dumps({
+                "conversion_failed": True,
+                "zones_created": 0,
+                "failure_reason": str(exc),
+                "report": str(Path(args.report_output).resolve()),
+            }, indent=2))
+            raise SystemExit(1)
     else:
         main()
