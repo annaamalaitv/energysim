@@ -1,4 +1,4 @@
-# Benchmark Corpus & Validation Section — Draft for ASim2026
+# Benchmark Corpus & Validation Section 
 
 *Prepared from an actual execution of the converter (`final_visualization_and_converter__4_.py`) against EnergyPlus 26.1.0 and four public IFC test models. All numbers below are real tool output, not illustrative placeholders.*
 
